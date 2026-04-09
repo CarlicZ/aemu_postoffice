@@ -11,12 +11,12 @@ const memory_usage_log_interval_ms =  1000 * 60 * 2;
 const PDP_BLOCK_MAX = 10 * 1024;
 const PTP_BLOCK_MAX = 50 * 1024;
 
-// max chunk size per server tick per session, considering a 2ms refresh interval, 256 data size, broadcasting to 8 other players, and then half it considering this is by tick rate, which is already very generous
-const MAX_TOTAL_CHUNK_SIZE = ((1000 / 2) * 256 * 8) / 2;
-
-// 在文件顶部常量区添加
+// 排队等待 listen 的最大重试次数和间隔
 const PTP_CONNECT_RETRY_MAX = 20;
 const PTP_CONNECT_RETRY_INTERVAL_MS = 300;
+
+// max chunk size per server tick per session, considering a 2ms refresh interval, 256 data size, broadcasting to 8 other players, and then half it considering this is by tick rate, which is already very generous
+const MAX_TOTAL_CHUNK_SIZE = ((1000 / 2) * 256 * 8) / 2;
 
 enum InitPacketType{
 	AEMU_POSTOFFICE_INIT_PDP = 0,
@@ -39,7 +39,7 @@ enum PdpState{
 }
 
 enum PtpState{
-    PTP_STATE_WAITING_FOR_LISTEN = -2, // 新增：正在排队等待 Listen 就绪
+	PTP_STATE_WAITING_FOR_LISTEN = -2,
 	PTP_STATE_WAITING = -1,
 	PTP_STATE_HEADER = 0,
 	PTP_STATE_DATA = 1,
@@ -135,6 +135,7 @@ interface Session{
 	ptp_wait_timeout:any,
 	init_timeout:any,
 	ptp_connect_retries:number,
+	deferred_timer:any,
 }
 
 interface SessionMap{
@@ -302,6 +303,8 @@ interface StatisticsEntry{
 	pdp_tx_ops:number,
 	pdp_rx:number,
 	pdp_rx_ops:number,
+	ptp_deferred_connects:number,
+	ptp_deferred_failures:number,
 }
 
 interface Statistics {
@@ -329,6 +332,8 @@ function update_statistics(update:Statistics, base:Statistics = statistics):unde
 		base_value.pdp_tx_ops += value.pdp_tx_ops;
 		base_value.pdp_rx += value.pdp_rx;
 		base_value.pdp_rx_ops += value.pdp_rx_ops;
+		base_value.ptp_deferred_connects += value.ptp_deferred_connects;
+		base_value.ptp_deferred_failures += value.ptp_deferred_failures;
 	}
 }
 
@@ -348,7 +353,9 @@ function get_statistics_obj(ip:string, container:Statistics = statistics):Statis
 		pdp_tx:0,
 		pdp_tx_ops:0,
 		pdp_rx:0,
-		pdp_rx_ops:0
+		pdp_rx_ops:0,
+		ptp_deferred_connects:0,
+		ptp_deferred_failures:0,
 	};
 	container[ip] = new_obj;
 	return new_obj;
@@ -452,6 +459,8 @@ function output_statistics(){
 
 		console.log(`  ptp connects ${obj.ptp_connects} avg ${obj.ptp_connects / interval_s}/s`);
 		console.log(`  ptp listen connects ${obj.ptp_listen_connects} avg ${obj.ptp_listen_connects / interval_s}/s`);
+		console.log(`  ptp deferred connects ${obj.ptp_deferred_connects} (succeeded after retry)`);
+		console.log(`  ptp deferred failures ${obj.ptp_deferred_failures} (gave up after retry)`);
 
 		console.log(`  ptp tx ops ${obj.ptp_tx_ops} avg ${obj.ptp_tx_ops / interval_s}/s`);
 		console.log(`  ptp tx ${obj.ptp_tx} bytes avg ${obj.ptp_tx / interval_s} bytes/s`);
@@ -492,6 +501,13 @@ function close_one_session(ctx:Session){
 	let session_deleted:boolean = false;
 
 	log(`closing ${ctx.session_name}`);
+
+	// 取消排队重试定时器
+	if (ctx.deferred_timer != undefined){
+		clearTimeout(ctx.deferred_timer);
+		ctx.deferred_timer = undefined;
+	}
+
 	ctx.socket.destroy();
 	if (ctx == sessions[ctx.session_name]){
 		session_deleted = true;
@@ -822,55 +838,24 @@ function ptp_tick(ctx:WorkerSession){
 	}
 }
 
-// 尝试配对 Connect 和 Listen
-function try_pair_ptp_connect(ctx: Session): boolean {
-    let listen_session = find_target_session(
-        SessionMode.SESSION_MODE_PTP_LISTEN, 
-        ctx.src_addr_str, 
-        ctx.dst_addr_str, 
-        0, 
-        ctx.dport
-    );
-
-    if (listen_session == undefined) return false;
-
-    let port_buf = Buffer.allocUnsafe(2);
-    port_buf.writeUInt16LE(ctx.sport);
-    
-    ctx.ptp_state = PtpState.PTP_STATE_WAITING;
-    listen_session.socket.write(Buffer.concat([ctx.src_addr, port_buf]));
-    
-    log(`paired connect session ${ctx.session_name} with listen ${listen_session.session_name}`);
-    return true;
-}
-
-// 当新的 Listen 注册时，唤醒所有匹配的 Connect
-function notify_waiting_connects(listen_session: Session) {
-    const waiting = Object.values(sessions).filter(s =>
-        s.state === SessionMode.SESSION_MODE_PTP_CONNECT &&
-        s.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN &&
-        s.dst_addr_str === listen_session.src_addr_str &&
-        s.dport === listen_session.sport
-    );
-
-    for (const connect_ctx of waiting) {
-        log(`waking up deferred connect ${connect_ctx.session_name} now that listen ${listen_session.session_name} is ready`);
-        
-        if (try_pair_ptp_connect(connect_ctx)) {
-            // 配对成功，启动 20 秒 Accept 超时限制
-            connect_ctx.ptp_wait_timeout = setTimeout(() => {
-                if (connect_ctx.ptp_state === PtpState.PTP_STATE_WAITING) {
-                    log(`Accept timeout after wake up for ${connect_ctx.session_name}`);
-                    close_session(connect_ctx);
-                }
-            }, 20000);
-        }
-    }
-}
-
-function remove_existing_and_insert_session(ctx:Session, name:string){
+function remove_existing_and_insert_session(ctx:Session, name:string):boolean{
 	const existing_session = sessions[name];
 	if (existing_session != undefined){
+		// 保护 ptp_listen：如果有 connect 在排队等它，不要销毁
+		if (existing_session.state === SessionMode.SESSION_MODE_PTP_LISTEN){
+			const has_waiting_connect = Object.values(sessions).some(s =>
+				s.state === SessionMode.SESSION_MODE_PTP_CONNECT &&
+				s.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN &&
+				s.dst_addr_str === existing_session.src_addr_str &&
+				s.dport === existing_session.sport
+			);
+			if (has_waiting_connect){
+				log(`preserving listen session ${existing_session.session_name} because connects are waiting for it; rejecting replacement`);
+				ctx.socket.destroy();
+				return false;
+			}
+		}
+
 		log(`dropping session ${existing_session.session_name} ${existing_session.sock_addr_str} for new session`);
 		switch(existing_session.state){
 			case SessionMode.SESSION_MODE_PDP:
@@ -903,6 +888,60 @@ function remove_existing_and_insert_session(ctx:Session, name:string){
 		sessions_by_ip[ctx.ip] = sessions_of_this_ip;
 	}
 	sessions_of_this_ip[name] = ctx;
+
+	return true;
+}
+
+// 尝试将 ptp_connect 与已有的 ptp_listen 配对
+// 返回 true 表示配对成功，false 表示 listen 尚未就绪
+function try_pair_ptp_connect(ctx:Session):boolean{
+	let listen_session = find_target_session(SessionMode.SESSION_MODE_PTP_LISTEN, ctx.src_addr_str, ctx.dst_addr_str, 0, ctx.dport);
+	if (listen_session == undefined){
+		return false;
+	}
+
+	let port = Buffer.allocUnsafe(2);
+	port.writeUInt16LE(ctx.sport);
+	ctx.ptp_state = PtpState.PTP_STATE_WAITING;
+	listen_session.socket.write(Buffer.concat([ctx.src_addr, port]));
+	const max_buffer_size = config.max_write_buffer_byte;
+	if (max_buffer_size != 0 && listen_session.socket.writableLength >= max_buffer_size){
+		log(`killing session ${listen_session.session_name} as write buffer has reached ${listen_session.socket.writableLength} bytes, max ${max_buffer_size} bytes`);
+		close_session(listen_session);
+		// listen 已经挂了，配对视为失败
+		ctx.ptp_state = PtpState.PTP_STATE_WAITING_FOR_LISTEN;
+		return false;
+	}
+
+	log(`paired connect session ${ctx.session_name} with listen ${listen_session.session_name}`);
+	return true;
+}
+
+// 当一个 ptp_listen session 注册成功后，唤醒所有正在等待它的 ptp_connect
+function notify_waiting_connects(listen_session:Session):void{
+	const waiting = Object.values(sessions).filter(s =>
+		s.state === SessionMode.SESSION_MODE_PTP_CONNECT &&
+		s.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN &&
+		s.dst_addr_str === listen_session.src_addr_str &&
+		s.dport === listen_session.sport
+	);
+
+	for (const connect_ctx of waiting){
+		log(`waking up deferred connect ${connect_ctx.session_name} now that listen ${listen_session.session_name} is ready`);
+		// 取消轮询定时器
+		if (connect_ctx.deferred_timer != undefined){
+			clearTimeout(connect_ctx.deferred_timer);
+			connect_ctx.deferred_timer = undefined;
+		}
+		let port = Buffer.allocUnsafe(2);
+		port.writeUInt16LE(connect_ctx.sport);
+		connect_ctx.ptp_state = PtpState.PTP_STATE_WAITING;
+		listen_session.socket.write(Buffer.concat([connect_ctx.src_addr, port]));
+
+		if (config.accounting_interval_ms > 0){
+			get_statistics_obj(connect_ctx.ip).ptp_deferred_connects++;
+		}
+	}
 }
 
 function strict_mode_verify_ip_addr(mac_addr:string, ip_addr:string){
@@ -1161,8 +1200,7 @@ function send_chunks_to_workers(){
 	for (const session of Object.values(sessions)){
 		switch(session.state){
 			case SessionMode.SESSION_MODE_PDP:
-			case SessionMode.SESSION_MODE_PTP_ACCEPT:
-			case SessionMode.SESSION_MODE_PTP_CONNECT:{
+			case SessionMode.SESSION_MODE_PTP_ACCEPT:{
 				if (session.worker == undefined){
 					break;
 				}
@@ -1172,22 +1210,31 @@ function send_chunks_to_workers(){
 					chunk_list = [];
 					chunk_lists[worker_id] = chunk_list;
 				}
-				/*
-				let transfer_list = transfer_lists[worker_id];
-				if (transfer_list == undefined){
-					transfer_list = [];
-					transfer_lists[worker_id] = transfer_list;
-				}
-				*/
 				chunk_list.push({
 					session_name:session.session_name,
 					chunks:session.chunks
 				});
-				/*
-				for(const chunk of session.chunks){
-					transfer_list.push(chunk.buffer);
+				session.chunks = [];
+				break;
+			}
+			case SessionMode.SESSION_MODE_PTP_CONNECT:{
+				// 如果还在排队等待 listen，尚未分配 worker，跳过
+				if (session.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN){
+					break;
 				}
-				*/
+				if (session.worker == undefined){
+					break;
+				}
+				const worker_id = session.worker.id;
+				let chunk_list = chunk_lists[worker_id];
+				if (chunk_list == undefined){
+					chunk_list = [];
+					chunk_lists[worker_id] = chunk_list;
+				}
+				chunk_list.push({
+					session_name:session.session_name,
+					chunks:session.chunks
+				});
 				session.chunks = [];
 				break;
 			}
@@ -1260,137 +1307,112 @@ function create_session(ctx:Session){
 
 			break;
 		}
-		// case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_LISTEN:{
-		// 	ctx.state = SessionMode.SESSION_MODE_PTP_LISTEN;
-		// 	ctx.session_name = `PTP_LISTEN ${get_mac_str(src_addr)} ${sport}`;
-		// 	remove_existing_and_insert_session(ctx, ctx.session_name);
-		// 	log(`created session ${ctx.session_name} for ${ctx.sock_addr_str}`);
-		// 	if (config.accounting_interval_ms > 0){
-		// 		track_connect(ctx.ip, true, true);
-		// 	}
-
-		// 	ctx.init_data = Buffer.allocUnsafe(0);
-		// 	ctx.outstanding_data = Buffer.allocUnsafe(0);
-
-		// 	break;
-		// }
-
-		case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_LISTEN: {
+		case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_LISTEN:{
 			ctx.state = SessionMode.SESSION_MODE_PTP_LISTEN;
 			ctx.session_name = `PTP_LISTEN ${get_mac_str(src_addr)} ${sport}`;
-			remove_existing_and_insert_session(ctx, ctx.session_name);
-			
-			log(`created session ${ctx.session_name}`);
-			notify_waiting_connects(ctx); // 关键：尝试唤醒排队者
+			const inserted = remove_existing_and_insert_session(ctx, ctx.session_name);
+			if (!inserted){
+				// remove_existing_and_insert_session 已经销毁了 socket
+				break;
+			}
+			log(`created session ${ctx.session_name} for ${ctx.sock_addr_str}`);
+			if (config.accounting_interval_ms > 0){
+				track_connect(ctx.ip, true, true);
+			}
+
+			ctx.init_data = Buffer.allocUnsafe(0);
+			ctx.outstanding_data = Buffer.allocUnsafe(0);
+
+			// 通知所有正在排队等待这个 listen 的 connect
+			notify_waiting_connects(ctx);
+
 			break;
 		}
-
-		// case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_CONNECT:{
-		// 	ctx.session_name = `PTP_CONNECT ${get_mac_str(src_addr)} ${sport} ${get_mac_str(dst_addr)} ${dport}`;
-
-		// 	let listen_session = find_target_session(SessionMode.SESSION_MODE_PTP_LISTEN, ctx.src_addr_str, ctx.dst_addr_str, 0, ctx.dport);
-		// 	if (listen_session == undefined){
-		// 		// 2 seconds of retries
-		// 		if (ctx.ptp_connect_retries < 8){
-		// 			const retry = () => {
-		// 				if (ctx.state != SessionMode.SESSION_MODE_INIT){
-		// 					return;
-		// 				}
-		// 				create_session(ctx);
-		// 			}
-		// 			ctx.ptp_connect_retries++;
-		// 			setTimeout(retry, 250);
-		// 			break;
-		// 		}
-		// 		const target_session_name = get_target_session_name(SessionMode.SESSION_MODE_PTP_LISTEN, ctx.src_addr_str, ctx.dst_addr_str, 0, ctx.dport);
-		// 		log(`not creating ${ctx.session_name} for ${ctx.sock_addr_str}, ${target_session_name} not found`);
-		// 		ctx.socket.destroy();
-		// 		break;
-		// 	}
-
-		// 	ctx.state = SessionMode.SESSION_MODE_PTP_CONNECT;
-
-		// 	remove_existing_and_insert_session(ctx, ctx.session_name);
-		// 	let port = Buffer.allocUnsafe(2);
-		// 	port.writeUInt16LE(sport);
-		// 	ctx.ptp_state = PtpState.PTP_STATE_WAITING;
-		// 	ctx.ptp_data = ctx.outstanding_data;
-		// 	listen_session.socket.write(Buffer.concat([src_addr, port]));
-		// 	const max_buffer_size = config.max_write_buffer_byte;
-		// 	if (max_buffer_size != 0 && listen_session.socket.writableLength >= max_buffer_size){
-		// 		log(`killing session ${listen_session.session_name} as write buffer has reached ${listen_session.socket.writableLength} bytes, max ${max_buffer_size} bytes`);
-		// 		close_session(listen_session);
-		// 		log(`not creating ${ctx.session_name} for ${ctx.sock_addr_str}, ${listen_session.session_name} is stale`);
-		// 		ctx.socket.destroy();
-		// 		break;
-		// 	}
-
-		// 	log(`created session ${ctx.session_name} for ${ctx.sock_addr_str}`);
-		// 	if (config.accounting_interval_ms > 0){
-		// 		track_connect(ctx.ip, true, false);
-		// 	}
-
-		// 	ctx.ptp_wait_timeout = setTimeout(() => {
-		// 		if (ctx.ptp_state == PtpState.PTP_STATE_WAITING){
-		// 			log(`the other side did not accept the connection request in 20 seconds, killing ${ctx.session_name} of ${ctx.sock_addr_str}`);
-		// 			close_session(ctx);
-		// 		}
-		// 	}, 20000);
-
-		// 	break;
-		// }
-
-		case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_CONNECT: {
+		case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_CONNECT:{
 			ctx.state = SessionMode.SESSION_MODE_PTP_CONNECT;
 			ctx.session_name = `PTP_CONNECT ${get_mac_str(src_addr)} ${sport} ${get_mac_str(dst_addr)} ${dport}`;
-			
-			remove_existing_and_insert_session(ctx, ctx.session_name);
 			ctx.ptp_data = ctx.outstanding_data;
 
-			if (try_pair_ptp_connect(ctx)) {
-				// 立即配对成功
+			const inserted = remove_existing_and_insert_session(ctx, ctx.session_name);
+			if (!inserted){
+				break;
+			}
+
+			if (config.accounting_interval_ms > 0){
+				track_connect(ctx.ip, true, false);
+			}
+
+			ctx.init_data = Buffer.allocUnsafe(0);
+			ctx.outstanding_data = Buffer.allocUnsafe(0);
+
+			// 尝试立即配对
+			if (try_pair_ptp_connect(ctx)){
+				log(`created session ${ctx.session_name} for ${ctx.sock_addr_str}`);
+				// 20秒超时兜底：等 ptp_accept 到来
 				ctx.ptp_wait_timeout = setTimeout(() => {
-					if (ctx.ptp_state == PtpState.PTP_STATE_WAITING) {
+					if (ctx.ptp_state == PtpState.PTP_STATE_WAITING){
+						log(`the other side did not accept the connection request in 20 seconds, killing ${ctx.session_name} of ${ctx.sock_addr_str}`);
 						close_session(ctx);
 					}
 				}, 20000);
-			} else {
-				// 进入排队模式
-				log(`queuing ${ctx.session_name}, listen not ready yet`);
+			}else{
+				// listen 还没就绪，进入排队状态
+				log(`queuing ${ctx.session_name} for ${ctx.sock_addr_str}, listen not ready yet`);
 				ctx.ptp_state = PtpState.PTP_STATE_WAITING_FOR_LISTEN;
+
 				let attempts = 0;
 
-				const try_deferred = () => {
-					if (sessions[ctx.session_name] !== ctx || ctx.ptp_state !== PtpState.PTP_STATE_WAITING_FOR_LISTEN) return;
+				const try_connect_deferred = () => {
+					// session 可能已被关闭
+					if (sessions[ctx.session_name] == undefined){
+						return;
+					}
+					if (ctx.ptp_state !== PtpState.PTP_STATE_WAITING_FOR_LISTEN){
+						return;
+					}
 
-					if (try_pair_ptp_connect(ctx)) {
-						log(`deferred connect ${ctx.session_name} succeeded after retry`);
-						// 配对后的 Accept 超时逻辑见 notify_waiting_connects
+					if (try_pair_ptp_connect(ctx)){
+						ctx.deferred_timer = undefined;
+						log(`deferred connect ${ctx.session_name} succeeded after ${attempts + 1} attempts`);
+						if (config.accounting_interval_ms > 0){
+							get_statistics_obj(ctx.ip).ptp_deferred_connects++;
+						}
+						// 20秒超时兜底
+						ctx.ptp_wait_timeout = setTimeout(() => {
+							if (ctx.ptp_state == PtpState.PTP_STATE_WAITING){
+								log(`the other side did not accept the connection request in 20 seconds, killing ${ctx.session_name} of ${ctx.sock_addr_str}`);
+								close_session(ctx);
+							}
+						}, 20000);
 						return;
 					}
 
 					attempts++;
-					if (attempts < PTP_CONNECT_RETRY_MAX) {
-						setTimeout(try_deferred, PTP_CONNECT_RETRY_INTERVAL_MS);
-					} else {
-						log(`giving up on ${ctx.session_name} after ${attempts} retries`);
+					if (attempts < PTP_CONNECT_RETRY_MAX){
+						ctx.deferred_timer = setTimeout(try_connect_deferred, PTP_CONNECT_RETRY_INTERVAL_MS);
+					}else{
+						log(`giving up on deferred connect ${ctx.session_name} after ${attempts} attempts`);
+						if (config.accounting_interval_ms > 0){
+							get_statistics_obj(ctx.ip).ptp_deferred_failures++;
+						}
 						close_session(ctx);
 					}
 				};
 
-				setTimeout(try_deferred, PTP_CONNECT_RETRY_INTERVAL_MS);
-				
-				// 整体硬超时兜底（约 8 秒）
+				ctx.deferred_timer = setTimeout(try_connect_deferred, PTP_CONNECT_RETRY_INTERVAL_MS);
+
+				// 整体最长等待时间兜底（retry_max * interval + margin）
+				const total_wait_ms = PTP_CONNECT_RETRY_MAX * PTP_CONNECT_RETRY_INTERVAL_MS + 2000;
 				setTimeout(() => {
-					if (ctx.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN && sessions[ctx.session_name] === ctx) {
-						log(`hard timeout for ${ctx.session_name}`);
+					if (ctx.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN && sessions[ctx.session_name] != undefined){
+						log(`hard timeout: deferred connect ${ctx.session_name} never found a listen, closing`);
 						close_session(ctx);
 					}
-				}, (PTP_CONNECT_RETRY_MAX * PTP_CONNECT_RETRY_INTERVAL_MS) + 2000);
+				}, total_wait_ms);
 			}
+
 			break;
 		}
-
 		case InitPacketType.AEMU_POSTOFFICE_INIT_PTP_ACCEPT:{
 			ctx.state = SessionMode.SESSION_MODE_PTP_ACCEPT;
 			ctx.session_name = `PTP_ACCEPT ${get_mac_str(src_addr)} ${sport} ${get_mac_str(dst_addr)} ${dport}`
@@ -1473,6 +1495,7 @@ function on_connection(socket:net.Socket){
 		ptp_wait_timeout:0,
 		init_timeout:0,
 		ptp_connect_retries:0,
+		deferred_timer:undefined,
 	};
 
 	socket.on("error", (err) => {
