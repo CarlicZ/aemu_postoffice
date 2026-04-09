@@ -6,3 +6,19 @@
 *.log
 *.exe
 *.dll
+
+# Node / TypeScript
+node_modules/
+*.tsbuildinfo
+*.js.map
+*.d.ts
+*.d.ts.map
+
+# 常见构建输出目录
+dist/
+build/
+coverage/
+
+# server_njs 编译产物（按需保留）
+server_njs/**/*.js
+server_njs/**/*-lock.json
