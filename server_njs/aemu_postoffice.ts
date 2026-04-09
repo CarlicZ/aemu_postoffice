@@ -408,8 +408,8 @@ function set_interval(func:() => void, interval_ms_num:number){
 		func();
 		let duration_ms:bigint = (process.hrtime.bigint() - begin_ns) / BigInt(1000000);
 		let wait_ms:bigint = interval_ms - duration_ms;
-		if (wait_ms <= 0){
-			wait_ms = BigInt(0);
+		if (wait_ms < BigInt(1)){
+			wait_ms = BigInt(1);
 		}
 		setTimeout(wrapper, Number(wait_ms));
 	};
@@ -422,8 +422,10 @@ function run_per_tick(func:() => void){
 		func();
 		let duration_ms:bigint = (process.hrtime.bigint() - begin_ns) / BigInt(1000000);
 		let wait_ms:bigint = BigInt(Math.floor(1000 / config.tick_rate_hz)) - duration_ms;
-		if (wait_ms <= 0){
-			wait_ms = BigInt(0);
+		// Enforce a minimum 1ms wait even when overloaded, to avoid a busy-loop
+		// that starves I/O callbacks and sends CPU to 100%.
+		if (wait_ms < BigInt(1)){
+			wait_ms = BigInt(1);
 		}
 		setTimeout(wrapper, Number(wait_ms));
 	};
@@ -786,6 +788,15 @@ function pdp_tick(ctx:WorkerSession){
 }
 
 function ptp_tick(ctx:WorkerSession){
+	// PTP_STATE_WAITING means the connect side is waiting for the accept side to show up.
+	// PTP_STATE_WAITING_FOR_LISTEN means the connect side is queued waiting for a listen session.
+	// In both cases the session is not yet fully paired — buffer data and return; the main thread
+	// will call ptp_tick again once pairing is complete and ptp_state advances to PTP_STATE_HEADER.
+	if (ctx.ptp_state === PtpState.PTP_STATE_WAITING ||
+		ctx.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN){
+		return;
+	}
+
 	let no_data = false;
 	while(!no_data){
 		switch(ctx.ptp_state){
@@ -1448,8 +1459,8 @@ function create_session(ctx:Session){
 			add_session_to_worker(connect_session);
 			add_session_to_worker(ctx);
 
-			add_session_ip_to_workers(connect_session.session_name, ctx.ip);
-			add_session_ip_to_workers(connect_session.session_name, ctx.ip);
+			add_session_ip_to_workers(connect_session.session_name, connect_session.ip);
+			add_session_ip_to_workers(ctx.session_name, ctx.ip);
 
 			connect_session.init_data = Buffer.allocUnsafe(0);
 			ctx.init_data = Buffer.allocUnsafe(0);
@@ -1532,10 +1543,26 @@ function on_connection(socket:net.Socket){
 				close_session(ctx);
 				break;
 			case SessionMode.SESSION_MODE_PTP_CONNECT:
-			case SessionMode.SESSION_MODE_PTP_ACCEPT:
+			case SessionMode.SESSION_MODE_PTP_ACCEPT:{
 				log(`${ctx.session_name} ${ctx.sock_addr_str} closed by client`);
-				setTimeout(()=>{close_session(ctx)}, (1000 / config.tick_rate_hz) * 10);
+				// Pause this socket so no more data events fire while we drain.
+				// Then after a short grace period, destroy only this session's socket
+				// and detach from the peer — the peer session stays alive so it can
+				// finish sending its own buffered data before the client reconnects.
+				ctx.socket.pause();
+				const peer = ctx.peer_session;
+				setTimeout(() => {
+					close_one_session(ctx);
+					// If the peer is still paired to us, clear the pairing so it
+					// doesn't try to forward to our now-destroyed socket. The peer's
+					// own socket.end / socket.error handler will close it independently.
+					if (peer != undefined && peer.peer_session === ctx){
+						peer.peer_session = undefined;
+						peer.peer_session_name = "";
+					}
+				}, (1000 / config.tick_rate_hz) * 10);
 				break;
+			}
 			default:
 				log(`bad state ${ctx.state} on socket end, debug this`);
 				process.exit(1);
