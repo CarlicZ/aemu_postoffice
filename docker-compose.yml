@@ -1,0 +1,21 @@
+services:
+  aemu-server:
+    build: 
+      context: ./server_njs
+    container_name: aemu-postoffice
+    # 使用端口映射模式
+    ports:
+      - "27313:27313" # 数据端口：仅监听本地回环地址
+      - "27314:27314" # 状态端口：仅监听本地回环地址
+    volumes:
+      - ./server_njs/aemu_postoffice.js:/aemu_postoffice.js:ro
+      - ./server_njs/config.json:/config.json:ro
+    command: node /aemu_postoffice.js
+    # 依然可以保留网络定义，如果以后有其他容器需要接入
+    restart: always
+    networks:
+      - aemu-net
+
+networks:
+  aemu-net:
+    driver: bridge
