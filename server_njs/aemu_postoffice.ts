@@ -136,6 +136,7 @@ interface Session{
 	init_timeout:any,
 	ptp_connect_retries:number,
 	deferred_timer:any,
+	hard_timeout:any,
 }
 
 interface SessionMap{
@@ -508,6 +509,18 @@ function close_one_session(ctx:Session){
 	if (ctx.deferred_timer != undefined){
 		clearTimeout(ctx.deferred_timer);
 		ctx.deferred_timer = undefined;
+	}
+
+	// 取消硬超时兜底定时器
+	if (ctx.hard_timeout != undefined){
+		clearTimeout(ctx.hard_timeout);
+		ctx.hard_timeout = undefined;
+	}
+
+	// 取消 init 阶段超时定时器
+	if (ctx.init_timeout != undefined){
+		clearTimeout(ctx.init_timeout);
+		ctx.init_timeout = undefined;
 	}
 
 	ctx.socket.destroy();
@@ -1414,7 +1427,8 @@ function create_session(ctx:Session){
 
 				// 整体最长等待时间兜底（retry_max * interval + margin）
 				const total_wait_ms = PTP_CONNECT_RETRY_MAX * PTP_CONNECT_RETRY_INTERVAL_MS + 2000;
-				setTimeout(() => {
+				ctx.hard_timeout = setTimeout(() => {
+					ctx.hard_timeout = undefined;
 					if (ctx.ptp_state === PtpState.PTP_STATE_WAITING_FOR_LISTEN && sessions[ctx.session_name] != undefined){
 						log(`hard timeout: deferred connect ${ctx.session_name} never found a listen, closing`);
 						close_session(ctx);
@@ -1507,12 +1521,15 @@ function on_connection(socket:net.Socket){
 		init_timeout:0,
 		ptp_connect_retries:0,
 		deferred_timer:undefined,
+		hard_timeout:undefined,
 	};
 
 	socket.on("error", (err) => {
 		switch(ctx.state){
 			case SessionMode.SESSION_MODE_INIT:
 				log(`${ctx.sock_addr_str} errored during init, ${err}`);
+				clearTimeout(ctx.init_timeout);
+				ctx.init_timeout = undefined;
 				ctx.socket.destroy();
 				break;
 			case SessionMode.SESSION_MODE_PDP:
@@ -1535,6 +1552,8 @@ function on_connection(socket:net.Socket){
 		switch(ctx.state){
 			case SessionMode.SESSION_MODE_INIT:
 				log(`${ctx.sock_addr_str} closed during init`);
+				clearTimeout(ctx.init_timeout);
+				ctx.init_timeout = undefined;
 				ctx.socket.destroy();
 				break;
 			case SessionMode.SESSION_MODE_PDP:
