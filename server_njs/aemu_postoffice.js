@@ -17,6 +17,7 @@ const PTP_BLOCK_MAX = 50 * 1024;
 // 排队等待listen的最大重试次数和间隔
 const PTP_CONNECT_RETRY_MAX = 20;
 const PTP_CONNECT_RETRY_INTERVAL_MS = 300;
+const PTP_CLOSE_GRACE_MS = 150;
 
 process.on('SIGTERM', () => {
    process.exit(1); 
@@ -205,19 +206,37 @@ function output_statistics(){
 }
 
 function close_one_session(ctx){
+	if (ctx.closed){
+		return;
+	}
+	ctx.closed = true;
+
 	log(`closing ${ctx.session_name}`);
 
-	// 取消排队重试定时器
-	if (ctx.deferred_timer != undefined){
-		clearTimeout(ctx.deferred_timer);
-		ctx.deferred_timer = undefined;
+	// 所有定时回调都必须随会话销毁，避免旧回调误删同名新会话。
+	for (const timer_name of ["deferred_timer", "hard_timeout", "ptp_wait_timeout", "init_timeout", "close_timer"]){
+		if (ctx[timer_name] != undefined){
+			clearTimeout(ctx[timer_name]);
+			ctx[timer_name] = undefined;
+		}
+	}
+
+	const peer = ctx.peer_session;
+	ctx.peer_session = undefined;
+	if (peer != undefined && peer.peer_session === ctx){
+		peer.peer_session = undefined;
 	}
 
 	ctx.socket.destroy();
-	delete sessions[ctx.session_name];
+	// 同名会话可能已被新连接替换，只删除仍指向当前 ctx 的索引。
+	if (sessions[ctx.session_name] === ctx){
+		delete sessions[ctx.session_name];
+	}
 	let sessions_of_this_mac = sessions_by_mac[ctx.src_addr_str];
 	if (sessions_of_this_mac != undefined){
-		delete sessions_of_this_mac[ctx.session_name];
+		if (sessions_of_this_mac[ctx.session_name] === ctx){
+			delete sessions_of_this_mac[ctx.session_name];
+		}
 		if (Object.keys(sessions_of_this_mac).length == 0){
 			delete sessions_by_mac[ctx.src_addr_str];
 		}
@@ -225,7 +244,9 @@ function close_one_session(ctx){
 
 	let sessions_of_this_ip = sessions_by_ip[ctx.ip];
 	if (sessions_of_this_ip != undefined){
-		delete sessions_of_this_ip[ctx.session_name];
+		if (sessions_of_this_ip[ctx.session_name] === ctx){
+			delete sessions_of_this_ip[ctx.session_name];
+		}
 		if (Object.keys(sessions_of_this_ip).length == 0){
 			delete sessions_by_ip[ctx.ip];
 		}
@@ -233,10 +254,11 @@ function close_one_session(ctx){
 }
 
 function close_session(ctx){
+	const peer = ctx.peer_session;
 	close_one_session(ctx);
 
-	if (ctx.peer_session != undefined){
-		close_one_session(ctx.peer_session);
+	if (peer != undefined){
+		close_one_session(peer);
 	}
 }
 
@@ -381,6 +403,12 @@ let pdp_tick = (ctx) => {
 }
 
 let ptp_tick = (ctx) => {
+	// Connect 还没有与 Accept 配对时只缓冲数据，否则会落入
+	// default 分支并导致整个服务进程退出。
+	if (ctx.closed || ctx.ptp_state === "waiting" || ctx.ptp_state === "waiting_for_listen"){
+		return;
+	}
+
 	let no_data = false;
 	while(!no_data){
 		switch(ctx.ptp_state){
@@ -411,8 +439,11 @@ let ptp_tick = (ctx) => {
 					let size = Buffer.alloc(4);
 					size.writeUInt32LE(ctx.ptp_data_size);
 
-					ctx.peer_session.socket.write(Buffer.concat([size, cur_data]));
-					track_bandwidth(ctx.peer_session.ip, true, false, ctx.ptp_data_size);
+					const peer = ctx.peer_session;
+					if (peer != undefined && !peer.closed && !peer.socket.destroyed){
+						peer.socket.write(Buffer.concat([size, cur_data]));
+						track_bandwidth(peer.ip, true, false, ctx.ptp_data_size);
+					}
 					track_bandwidth(ctx.ip, true, true, ctx.ptp_data_size);
 
 					ctx.ptp_state = "header";
@@ -442,6 +473,19 @@ function try_pair_ptp_connect(ctx){
 	listen_session.socket.write(Buffer.concat([ctx.src_addr, port]));
 	log(`paired connect session ${ctx.session_name} with listen ${listen_session.session_name}`);
 	return true;
+}
+
+function start_ptp_accept_timeout(ctx){
+	if (ctx.ptp_wait_timeout != undefined){
+		clearTimeout(ctx.ptp_wait_timeout);
+	}
+	ctx.ptp_wait_timeout = setTimeout(() => {
+		ctx.ptp_wait_timeout = undefined;
+		if (ctx.ptp_state === "waiting" && sessions[ctx.session_name] === ctx){
+			log(`the other side did not accept the connection request in 20 seconds, killing ${ctx.session_name} of ${get_sock_addr_str(ctx.socket)}`);
+			close_session(ctx);
+		}
+	}, 20000);
 }
 
 function remove_existing_and_insert_session(ctx, name){
@@ -525,18 +569,20 @@ function notify_waiting_connects(listen_session){
 
 	for (const connect_ctx of waiting){
 		log(`waking up deferred connect ${connect_ctx.session_name} now that listen ${listen_session.session_name} is ready`);
-		// 取消轮询定时器
-		if (connect_ctx.deferred_timer != undefined){
-			clearTimeout(connect_ctx.deferred_timer);
-			connect_ctx.deferred_timer = undefined;
+		if (try_pair_ptp_connect(connect_ctx)){
+			// 配对成功后再取消排队超时；若 strict mode 拒绝配对，仍保留正常清理路径。
+			if (connect_ctx.deferred_timer != undefined){
+				clearTimeout(connect_ctx.deferred_timer);
+				connect_ctx.deferred_timer = undefined;
+			}
+			if (connect_ctx.hard_timeout != undefined){
+				clearTimeout(connect_ctx.hard_timeout);
+				connect_ctx.hard_timeout = undefined;
+			}
+			start_ptp_accept_timeout(connect_ctx);
+			let stat_obj = get_statistics_obj(connect_ctx.ip);
+			stat_obj.ptp_deferred_connects++;
 		}
-		let port = Buffer.alloc(2);
-		port.writeUInt16LE(connect_ctx.sport);
-		connect_ctx.ptp_state = "waiting";
-		listen_session.socket.write(Buffer.concat([connect_ctx.src_addr, port]));
-
-		let stat_obj = get_statistics_obj(connect_ctx.ip);
-		stat_obj.ptp_deferred_connects++;
 	}
 }
 
@@ -561,6 +607,10 @@ function create_session(ctx){
 	ctx.dst_addr_str = get_mac_str(ctx.dst_addr);
 
 	delete ctx.init_data;
+	if (ctx.init_timeout != undefined){
+		clearTimeout(ctx.init_timeout);
+		ctx.init_timeout = undefined;
+	}
 
 	if (!strict_mode_verify_ip_addr(ctx.src_addr_str, ctx.ip)){
 		ctx.socket.destroy();
@@ -613,13 +663,7 @@ function create_session(ctx){
 			if (try_pair_ptp_connect(ctx)){
 				log(`created session ${ctx.session_name} for ${get_sock_addr_str(ctx.socket)}`);
 				// 等 ptp_accept 到来后再设置 ptp_state = "header"
-				// 20秒超时兜底
-				setTimeout(() => {
-					if (ctx.ptp_state == "waiting"){
-						log(`the other side did not accept the connection request in 20 seconds, killing ${ctx.session_name} of ${get_sock_addr_str(ctx.socket)}`);
-						close_session(ctx);
-					}
-				}, 20000);
+				start_ptp_accept_timeout(ctx);
 			}else{
 				// listen 还没就绪，进入排队状态
 				log(`queuing ${ctx.session_name} for ${get_sock_addr_str(ctx.socket)}, listen not ready yet`);
@@ -629,7 +673,7 @@ function create_session(ctx){
 
 				const try_connect_deferred = () => {
 					// session 可能已被关闭
-					if (sessions[ctx.session_name] == undefined){
+					if (sessions[ctx.session_name] !== ctx){
 						return;
 					}
 					if (ctx.ptp_state !== "waiting_for_listen"){
@@ -638,16 +682,14 @@ function create_session(ctx){
 
 					if (try_pair_ptp_connect(ctx)){
 						ctx.deferred_timer = undefined;
+						if (ctx.hard_timeout != undefined){
+							clearTimeout(ctx.hard_timeout);
+							ctx.hard_timeout = undefined;
+						}
 						log(`deferred connect ${ctx.session_name} succeeded after ${attempts + 1} attempts`);
 						let stat_obj = get_statistics_obj(ctx.ip);
 						stat_obj.ptp_deferred_connects++;
-						// 20秒超时兜底
-						setTimeout(() => {
-							if (ctx.ptp_state == "waiting"){
-								log(`the other side did not accept the connection request in 20 seconds, killing ${ctx.session_name} of ${get_sock_addr_str(ctx.socket)}`);
-								close_session(ctx);
-							}
-						}, 20000);
+						start_ptp_accept_timeout(ctx);
 						return;
 					}
 
@@ -666,8 +708,9 @@ function create_session(ctx){
 
 				// 整体最长等待时间兜底（retry_max * interval + margin）
 				const total_wait_ms = PTP_CONNECT_RETRY_MAX * PTP_CONNECT_RETRY_INTERVAL_MS + 2000;
-				setTimeout(() => {
-					if (ctx.ptp_state === "waiting_for_listen" && sessions[ctx.session_name] != undefined){
+				ctx.hard_timeout = setTimeout(() => {
+					ctx.hard_timeout = undefined;
+					if (ctx.ptp_state === "waiting_for_listen" && sessions[ctx.session_name] === ctx){
 						log(`hard timeout: deferred connect ${ctx.session_name} never found a listen, closing`);
 						close_session(ctx);
 					}
@@ -680,7 +723,7 @@ function create_session(ctx){
 			ctx.session_name = `PTP_ACCEPT ${get_mac_str(src_addr)} ${sport} ${get_mac_str(dst_addr)} ${dport}`
 
 			let connect_session = find_target_session("ptp_connect", ctx.src_addr_str, ctx.dst_addr_str, ctx.sport, ctx.dport);
-			if (connect_session == undefined){
+			if (connect_session == undefined || connect_session.ptp_state !== "waiting"){
 				log(`connect session not found, closing ${ctx.session_name} of ${get_sock_addr_str(ctx.socket)}`);
 				ctx.socket.destroy();
 				break;
@@ -691,6 +734,10 @@ function create_session(ctx){
 			connect_session.peer_session = ctx;
 			ctx.ptp_state = "header";
 			connect_session.ptp_state = "header";
+			if (connect_session.ptp_wait_timeout != undefined){
+				clearTimeout(connect_session.ptp_wait_timeout);
+				connect_session.ptp_wait_timeout = undefined;
+			}
 			ctx.ptp_data = ctx.outstanding_data;
 			delete ctx.outstanding_data;
 
@@ -721,13 +768,21 @@ let on_connection = (socket) => {
 		socket:socket,
 		init_data:Buffer.alloc(0),
 		state:"init",
-		ip:socket.remoteAddress
+		ip:socket.remoteAddress,
+		closed:false,
+		deferred_timer:undefined,
+		hard_timeout:undefined,
+		ptp_wait_timeout:undefined,
+		init_timeout:undefined,
+		close_timer:undefined,
 	};
 
 	socket.on("error", (err) => {
 		switch(ctx.state){
 			case "init":
 				log(`${get_sock_addr_str(ctx.socket)} errored during init, ${err}`);
+				clearTimeout(ctx.init_timeout);
+				ctx.init_timeout = undefined;
 				ctx.socket.destroy();
 				break;
 			case "pdp":
@@ -750,6 +805,8 @@ let on_connection = (socket) => {
 		switch(ctx.state){
 			case "init":
 				log(`${get_sock_addr_str(ctx.socket)} closed during init`);
+				clearTimeout(ctx.init_timeout);
+				ctx.init_timeout = undefined;
 				ctx.socket.destroy();
 				break;
 			case "pdp":
@@ -760,7 +817,14 @@ let on_connection = (socket) => {
 			case "ptp_accept":
 			case "ptp_connect":
 				log(`${ctx.session_name} ${get_sock_addr_str(ctx.socket)} closed by client`);
-				close_session(ctx);
+				// TCP FIN 只表示本端不再发送；保留对端，让战斗结束尾包可以排空。
+				ctx.socket.pause();
+				if (ctx.close_timer == undefined && !ctx.closed){
+					ctx.close_timer = setTimeout(() => {
+						ctx.close_timer = undefined;
+						close_one_session(ctx);
+					}, PTP_CLOSE_GRACE_MS);
+				}
 				break;
 			default:
 				log(`bad state ${ctx.state} on socket end, debug this`);
@@ -810,6 +874,7 @@ let on_connection = (socket) => {
 	ctx.init_timeout = setTimeout(() => {
 		if (ctx.state == "init"){
 			log(`removing stale connection ${get_sock_addr_str(ctx.socket)}`);
+			ctx.init_timeout = undefined;
 			ctx.socket.destroy();
 		}
 	}, 20000)

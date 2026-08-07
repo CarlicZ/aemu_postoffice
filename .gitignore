@@ -18,7 +18,3 @@ node_modules/
 dist/
 build/
 coverage/
-
-# server_njs 编译产物（按需保留）
-server_njs/**/*.js
-server_njs/**/*-lock.json

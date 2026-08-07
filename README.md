@@ -2,6 +2,8 @@
 
 PSP adhoc data forwarder protocol and implementation, for easy and reliable adhoc multiplayer through internet
 
+This project maintains a fork based on an early version of [aemu_postoffice](https://github.com/Kethen/aemu_postoffice.git), retaining its centralized processing model because the concurrent-processing logic introduced in later TypeScript versions of the upstream project was found to add latency to *Dissidia 012 Final Fantasy*'s multiplayer networking.
+
 Current users:
 - [PSP internet adhoc plugin aemu](https://github.com/kethen/aemu)
 - [PPSSPP](http://github.com/hrydgard/ppsspp)
